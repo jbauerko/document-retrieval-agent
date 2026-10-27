@@ -1,0 +1,9 @@
+# Only send application sources and locked dependencies to the Docker builder.
+**
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!src/
+!src/**
+src/**/__pycache__/
+src/**/*.pyc
