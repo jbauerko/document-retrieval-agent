@@ -1,12 +1,12 @@
-"""Opt-in real-site checks: DOCUMENT_RETRIEVAL_AGENT_LIVE_TEST=1 uv run pytest tests/test_live.py -v -s."""
+"""Opt-in task-tool checks against the public site, without a model or email."""
 
 import os
 import zipfile
 
 import pytest
 
-from document_retrieval_agent.browser import UARBBrowser
-from document_retrieval_agent.tools import Tools
+from document_retrieval_agent.retrieval.browser import BrowserSession
+from document_retrieval_agent.retrieval.tools import Tools
 
 pytestmark = pytest.mark.skipif(
     os.getenv("DOCUMENT_RETRIEVAL_AGENT_LIVE_TEST") != "1", reason="Live website checks are opt-in"
@@ -14,38 +14,35 @@ pytestmark = pytest.mark.skipif(
 
 
 async def test_real_matter_downloads_and_empty_category(tmp_path):
-    async with UARBBrowser() as browser:
-        tools = Tools(browser, tmp_path / "other_documents")
-        matter = await tools.search_matter("M12205")
-        assert matter["matter_number"] == "M12205"
-        assert "Halifax Regional Water Commission" in matter["metadata"]["title"]
-        listing = await tools.list_documents("Other Documents")
+    async with BrowserSession() as browser:
+        tools = Tools(browser, tmp_path / "other")
+        result = await tools.execute(
+            "search_matter", {"matter_number": "M12205", "document_type": "Other Documents"}
+        )
+        assert "Halifax Regional Water Commission" in result["matter"]["metadata"]["title"]
+        listing = await tools.execute("open_category", {"category": "Other Documents"})
         assert len(listing["documents"]) == 10
         for document in listing["documents"]:
-            result = await tools.download_document(document["id"])
-            print(f"Downloaded {result['id']}: {result['bytes']} bytes", flush=True)
+            result = await tools.execute("download_document", {"document_id": document["id"]})
+            assert "observation" not in result
+            print(f"Downloaded {document['id']}: {result['download']['bytes']} bytes", flush=True)
         result = await tools.create_archive()
         assert result["status"] == "complete"
         with zipfile.ZipFile(result["archive"]) as archive:
             assert len(archive.namelist()) == 10
-            for name in archive.namelist():
-                if name.lower().endswith(".pdf"):
-                    assert archive.read(name).startswith(b"%PDF")
-        # The adapter supports tab changes; each agent run still requests just one category.
-        assert await browser.list_documents("Transcripts") == []
-        assert await browser.list_documents("Recordings") == []
-        keys = await browser.list_documents("Key Documents")
-        assert len(keys) == min(10, matter["counts"]["Key Documents"])
-        print(f"Listed {len(keys)} Key Documents", flush=True)
-        (tmp_path / "keys").mkdir()
-        assert (await browser.download_document(keys[0]["id"], tmp_path / "keys"))["path"]
-        exhibits = await browser.list_documents("Exhibits")
-        assert len(exhibits) == min(10, matter["counts"]["Exhibits"])
-        (tmp_path / "exhibits").mkdir()
-        assert (await browser.download_document(exhibits[0]["id"], tmp_path / "exhibits"))["path"]
+            assert all(archive.read(name).startswith(b"%PDF") for name in archive.namelist())
+        empty = Tools(browser, tmp_path / "empty")
+        await empty.search_matter("M12205", "Transcripts")
+        assert (await empty.open_category("Transcripts"))["documents"] == []
+        assert (await empty.create_archive())["status"] == "complete"
 
 
-async def test_missing_matter_is_not_silently_replaced():
-    async with UARBBrowser() as browser:
-        with pytest.raises(ValueError, match="Could not open requested matter M99999"):
-            await browser.search_matter("M99999")
+async def test_missing_matter_is_not_silently_recorded(tmp_path):
+    async with BrowserSession() as browser:
+        tools = Tools(browser, tmp_path)
+        with pytest.raises(Exception) as error:
+            await tools.execute(
+                "search_matter", {"matter_number": "M99999", "document_type": "Other Documents"}
+            )
+        assert "No Records Found" in error.value.observation["text"]
+        assert tools.matter is None

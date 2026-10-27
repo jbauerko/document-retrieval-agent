@@ -7,11 +7,11 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from .agent import AgentSession
-from .browser import UARBBrowser
+from .agent import DEFAULT_MAX_CALLS, AgentSession
+from .agent.model import DEFAULT_MODEL, ChatModel
 from .config import ModelConfig
-from .model import DEFAULT_MODEL, ChatModel
-from .tools import Tools
+from .retrieval.browser import BrowserSession
+from .retrieval.tools import Tools
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -37,7 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output", type=Path, default=Path("runs"), help="Parent of run directories"
     )
-    parser.add_argument("--max-calls", type=int, default=30)
+    parser.add_argument("--max-calls", type=int, default=DEFAULT_MAX_CALLS)
     parser.add_argument("--timeout", type=float, default=600, help="Agent timeout in seconds")
     return parser
 
@@ -106,7 +106,7 @@ async def run(request: str, config: ModelConfig, args: argparse.Namespace) -> in
     output.mkdir(parents=True)
     print(f"Run directory: {output}", file=sys.stderr)
 
-    async with UARBBrowser(headless=not args.headed) as browser:
+    async with BrowserSession(headless=not args.headed) as browser:
         model = ChatModel(config.model, config.api_base, config.api_key)
         session = AgentSession(
             model,

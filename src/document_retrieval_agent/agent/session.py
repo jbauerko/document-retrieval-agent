@@ -4,13 +4,17 @@ import asyncio
 import json
 from collections.abc import Callable
 
+from ..output import log_event, save_result
+from ..retrieval.schemas import TOOL_SCHEMAS
+from ..retrieval.tools import Tools
 from .model import Model
-from .output import log_event, save_result
 from .prompts import SYSTEM_PROMPT
-from .tools import TOOL_SCHEMAS, Tools
+
+DEFAULT_MAX_CALLS = 100
 
 COMPLETION_REMINDER = (
-    "Retrieval is unfinished. Complete the listed downloads and create "
+    "Retrieval is unfinished. Continue observing and using browser tools, record the matter "
+    "and document listing, complete the downloads and create "
     "the archive, or clearly explain the blocking error."
 )
 
@@ -23,7 +27,7 @@ class AgentSession:
         model: Model,
         tools: Tools,
         *,
-        max_calls: int = 30,
+        max_calls: int = DEFAULT_MAX_CALLS,
         timeout: float = 600,
         progress: Callable[[str], None] | None = None,
         conversation: list[dict] | None = None,
@@ -92,7 +96,15 @@ class AgentSession:
         except Exception as exc:
             # Tool failures go back to the model so it can retry or explain them.
             outcome = {"ok": False, "error": str(exc)}
+            if getattr(exc, "observation", None):
+                outcome["observation"] = exc.observation
         log_event(self.tools.output, "tool", name=name, arguments=arguments, output=outcome)
+        if (
+            "observation" in outcome
+            or "observation" in outcome.get("result", {})
+            or (outcome["ok"] and name in {"search_matter", "open_category", "download_document"})
+        ):
+            self._retire_observations()
         self.messages.append(
             {
                 "role": "tool",
@@ -100,6 +112,22 @@ class AgentSession:
                 "content": json.dumps(outcome),
             }
         )
+
+    def _retire_observations(self) -> None:
+        """Keep only the latest full page snapshot in model context; the trace keeps all of them."""
+        for message in self.messages:
+            if message["role"] != "tool":
+                continue
+            outcome = json.loads(message["content"])
+            container = outcome.get("result", outcome)
+            if isinstance(container, dict) and "observation" in container:
+                observation = container["observation"]
+                container["observation"] = {
+                    "snapshot_id": observation["snapshot_id"],
+                    "url": observation["url"],
+                    "retired": "Use the newest observation; these element refs expired.",
+                }
+                message["content"] = json.dumps(outcome)
 
     def _needs_completion_reminder(self) -> bool:
         return bool(self.tools.matter and not self.tools.archive and not self.completion_reminded)
@@ -135,7 +163,7 @@ async def run_agent(
     model: Model,
     tools: Tools,
     *,
-    max_calls: int = 30,
+    max_calls: int = DEFAULT_MAX_CALLS,
     timeout: float = 600,
     progress: Callable[[str], None] | None = None,
     conversation: list[dict] | None = None,

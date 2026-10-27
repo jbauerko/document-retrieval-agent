@@ -4,52 +4,90 @@ import zipfile
 import pytest
 
 from document_retrieval_agent.agent import run_agent
-from document_retrieval_agent.browser import parse_counts
-from document_retrieval_agent.tools import CATEGORIES, Tools, safe_filename
+from document_retrieval_agent.retrieval.documents import (
+    CATEGORIES,
+    METADATA_FIELDS,
+    parse_counts,
+    safe_filename,
+)
+from document_retrieval_agent.retrieval.tools import Tools
+
+METADATA = dict.fromkeys(METADATA_FIELDS)
+METADATA["title"] = "Test matter"
 
 
 class FakeBrowser:
+    site_url = "https://example.test"
+
     def __init__(self, count=12, fail=None):
         self.count = count
         self.fail = fail
         self.download_calls = []
+        self.generation = 0
 
-    async def search_matter(self, matter_number):
+    async def read_text(self):
         counts = dict.fromkeys(CATEGORIES, 0)
         counts["Other Documents"] = self.count
+        return "M12205\nTest matter\n" + "\n".join(
+            f"{key} - {value}" for key, value in counts.items()
+        )
+
+    async def observe_page(self):
+        self.generation += 1
         return {
-            "matter_number": matter_number,
-            "metadata": {"title": "Test matter"},
-            "counts": counts,
+            "snapshot_id": self.generation,
+            "url": self.site_url,
+            "text": await self.read_text(),
+            "elements": [],
+            "rows": [{"text": f"{i} Document {i} Public"} for i in range(self.count)],
         }
 
-    async def list_documents(self, document_type):
-        return [{"id": str(i), "title": f"Document {i}"} for i in range(self.count)]
+    async def open_site(self):
+        return await self.observe_page()
 
-    async def download_document(self, document_id, directory):
+    async def click(self, element_ref):
+        if element_ref == "category":
+            target = {"label": f"Other Documents - {self.count}", "context": ""}
+        else:
+            document_id = element_ref.removeprefix("row_")
+            target = {
+                "label": "GO GET IT",
+                "context": f"{document_id} Document {document_id} Public",
+            }
+        return {"target": target, "observation": await self.observe_page()}
+
+    async def download(self, element_ref, directory, document_id):
         self.download_calls.append(document_id)
         if document_id == self.fail:
             raise ValueError("Download unavailable")
         path = directory / f"{document_id}.pdf"
         path.write_bytes(b"%PDF-test-content")
-        return {"path": str(path)}
+        return {"path": str(path), "observation": await self.observe_page()}
 
 
 async def prepare(tmp_path, count=12, fail=None):
     tools = Tools(FakeBrowser(count, fail), tmp_path)
-    await tools.search_matter("M12205")
-    listing = await tools.list_documents("Other Documents")
-    return tools, listing["documents"]
+    await tools.open_site("M12205", "Other Documents")
+    await tools.record_matter(METADATA.copy())
+    await tools.click("category")
+    documents = [{"id": str(i), "title": f"Document {i}"} for i in range(min(count, 10))]
+    await tools.record_documents(documents)
+    return tools, documents
+
+
+async def fetch_document(tools, document_id):
+    await tools.click(f"row_{document_id}")
+    return (await tools.download("file", document_id))["download"]
 
 
 async def test_limit_idempotency_and_zip(tmp_path):
     tools, documents = await prepare(tmp_path)
     assert len(documents) == 10
     with pytest.raises(ValueError, match="document ID"):
-        await tools.download_document("11")
+        await fetch_document(tools, "11")
     for document in documents:
-        await tools.download_document(document["id"])
-    await tools.download_document("0")
+        await fetch_document(tools, document["id"])
+    await fetch_document(tools, "0")
     assert len(tools.browser.download_calls) == 10
     result = await tools.create_archive()
     assert result["status"] == "complete"
@@ -59,19 +97,19 @@ async def test_limit_idempotency_and_zip(tmp_path):
         assert len(archive.namelist()) == 10
         assert archive.testzip() is None
     with pytest.raises(ValueError, match="One matter"):
-        await tools.search_matter("M12383")
-    with pytest.raises(ValueError, match="One document category"):
-        await tools.list_documents("Exhibits")
+        await tools.open_site("M12383", "Other Documents")
+    with pytest.raises(ValueError, match="one document category"):
+        await tools.open_site("M12205", "Exhibits")
 
 
 async def test_partial_downloads_are_reported(tmp_path):
     tools, documents = await prepare(tmp_path, 3, fail="1")
-    await tools.download_document("0")
+    await fetch_document(tools, "0")
     with pytest.raises(ValueError, match="Attempt all"):
         await tools.create_archive()
     with pytest.raises(ValueError, match="unavailable"):
-        await tools.download_document("1")
-    await tools.download_document("2")
+        await fetch_document(tools, "1")
+    await fetch_document(tools, "2")
     result = await tools.create_archive()
     assert result["status"] == "partial"
     assert result["downloaded_count"] == 2
@@ -85,7 +123,7 @@ async def test_empty_category_and_failed_download_are_distinct(tmp_path):
     assert (await tools.create_archive())["status"] == "complete"
     tools, _ = await prepare(tmp_path / "failed", 1, fail="0")
     with pytest.raises(ValueError):
-        await tools.download_document("0")
+        await fetch_document(tools, "0")
     with pytest.raises(ValueError, match="No successful"):
         await tools.create_archive()
 
@@ -118,9 +156,12 @@ async def test_agent_recovers_from_invalid_tool_and_writes_artifacts(tmp_path):
     model = ScriptedModel(
         [
             call("execute_shell", command="bad"),
-            call("search_matter", matter_number="M12205"),
-            call("list_documents", document_type="Other Documents"),
-            call("download_document", document_id="0"),
+            call("open_site", matter_number="M12205", document_type="Other Documents"),
+            call("record_matter", metadata=METADATA),
+            call("click", element_ref="category"),
+            call("record_documents", documents=[{"id": "0", "title": "Document 0"}]),
+            call("click", element_ref="row_0"),
+            call("download", element_ref="file", document_id="0"),
             call("create_archive"),
             {"role": "assistant", "content": "Found one file. ZIP is ready."},
         ]
@@ -134,7 +175,7 @@ async def test_agent_recovers_from_invalid_tool_and_writes_artifacts(tmp_path):
     assert result["reply"]["subject"] == "M12205 — Other Documents"
     assert result["reply"]["attachments"] == [result["archive"]]
     assert (tmp_path / "reply.txt").read_text().split("\n\n", 1)[1].strip() == reply
-    assert len((tmp_path / "events.jsonl").read_text().splitlines()) == 6
+    assert len((tmp_path / "events.jsonl").read_text().splitlines()) == result["tool_calls"] + 1
 
 
 async def test_clarification_does_not_access_browser(tmp_path):
@@ -156,7 +197,8 @@ async def test_budget_stops_loop_and_saves_failure(tmp_path):
 async def test_premature_final_answer_cannot_mark_retrieval_complete(tmp_path):
     model = ScriptedModel(
         [
-            call("search_matter", matter_number="M12205"),
+            call("open_site", matter_number="M12205", document_type="Other Documents"),
+            call("record_matter", metadata=METADATA),
             {"role": "assistant", "content": "Done."},
             {"role": "assistant", "content": "Done."},
         ]
@@ -204,13 +246,20 @@ def test_cli_request_to_zip_and_draft(tmp_path, monkeypatch, input_mode):
     import httpx
 
     from document_retrieval_agent import cli
-    from document_retrieval_agent.model import ChatModel
+    from document_retrieval_agent.agent.model import ChatModel
 
     steps = [
-        call("search_matter", matter_number="M12205"),
-        call("list_documents", document_type="Other Documents"),
-        call("download_document", document_id="0"),
-        call("download_document", document_id="1"),
+        call("open_site", matter_number="M12205", document_type="Other Documents"),
+        call("record_matter", metadata=METADATA),
+        call("click", element_ref="category"),
+        call(
+            "record_documents",
+            documents=[{"id": "0", "title": "Document 0"}, {"id": "1", "title": "Document 1"}],
+        ),
+        call("click", element_ref="row_0"),
+        call("download", element_ref="file", document_id="0"),
+        call("click", element_ref="row_1"),
+        call("download", element_ref="file", document_id="1"),
         call("create_archive"),
         {
             "role": "assistant",
@@ -266,7 +315,7 @@ def test_cli_request_to_zip_and_draft(tmp_path, monkeypatch, input_mode):
         lambda _: "Other docs, please" if input_mode == "clarification" else original_request,
     )
     monkeypatch.setattr(sys, "argv", argv)
-    monkeypatch.setattr(cli, "UARBBrowser", Browser)
+    monkeypatch.setattr(cli, "BrowserSession", Browser)
     monkeypatch.setattr(
         cli,
         "ChatModel",
@@ -295,9 +344,12 @@ async def test_follow_up_reuses_request_and_conversation(tmp_path):
     model = ScriptedModel(
         [
             {"role": "assistant", "content": "Which document category would you like?"},
-            call("search_matter", matter_number="M12205"),
-            call("list_documents", document_type="Other Documents"),
-            call("download_document", document_id="0"),
+            call("open_site", matter_number="M12205", document_type="Other Documents"),
+            call("record_matter", metadata=METADATA),
+            call("click", element_ref="category"),
+            call("record_documents", documents=[{"id": "0", "title": "Document 0"}]),
+            call("click", element_ref="row_0"),
+            call("download", element_ref="file", document_id="0"),
             call("create_archive"),
             {"role": "assistant", "content": "Hi, your ZIP for M12205 is ready."},
         ]
@@ -323,10 +375,17 @@ async def test_follow_up_reuses_request_and_conversation(tmp_path):
 async def test_partial_reply_only_attaches_successful_files(tmp_path):
     model = ScriptedModel(
         [
-            call("search_matter", matter_number="M12205"),
-            call("list_documents", document_type="Other Documents"),
-            call("download_document", document_id="0"),
-            call("download_document", document_id="1"),
+            call("open_site", matter_number="M12205", document_type="Other Documents"),
+            call("record_matter", metadata=METADATA),
+            call("click", element_ref="category"),
+            call(
+                "record_documents",
+                documents=[{"id": "0", "title": "Document 0"}, {"id": "1", "title": "Document 1"}],
+            ),
+            call("click", element_ref="row_0"),
+            call("download", element_ref="file", document_id="0"),
+            call("click", element_ref="row_1"),
+            call("download", element_ref="file", document_id="1"),
             call("create_archive"),
             {"role": "assistant", "content": "Hi, one of the two downloads was unavailable."},
         ]
@@ -338,3 +397,184 @@ async def test_partial_reply_only_attaches_successful_files(tmp_path):
     assert "couldn't complete" in result["reply"]["body"]
     with zipfile.ZipFile(result["reply"]["attachments"][0]) as archive:
         assert archive.namelist() == ["0.pdf"]
+
+
+async def test_model_values_must_match_observed_matter_and_rows(tmp_path):
+    tools = Tools(FakeBrowser(2), tmp_path)
+    await tools.open_site("M12205", "Other Documents")
+    with pytest.raises(ValueError, match="copied from observed"):
+        await tools.record_matter({**METADATA, "title": "Invented title"})
+    await tools.record_matter(METADATA)
+    await tools.click("category")
+    with pytest.raises(ValueError, match="not found"):
+        await tools.record_documents(
+            [
+                {"id": "99", "title": "Invented document"},
+                {"id": "1", "title": "Document 1"},
+            ]
+        )
+    with pytest.raises(ValueError, match="row order"):
+        await tools.record_documents(
+            [
+                {"id": "1", "title": "Document 1"},
+                {"id": "0", "title": "Document 0"},
+            ]
+        )
+    assert tools.listed is False
+
+
+async def test_download_must_follow_the_matching_document_row(tmp_path):
+    tools, _ = await prepare(tmp_path, 2)
+    with pytest.raises(ValueError, match="row control"):
+        await tools.download("file", "0")
+    await tools.click("row_1")
+    with pytest.raises(ValueError, match="row control"):
+        await tools.download("file", "0")
+    assert tools.browser.download_calls == []
+
+
+async def test_only_latest_observation_stays_in_model_context(tmp_path):
+    history = []
+    model = ScriptedModel(
+        [
+            call("open_site", matter_number="M12205", document_type="Other Documents"),
+            call("observe_page"),
+            {"role": "assistant", "content": "Unable to continue."},
+        ]
+    )
+    await run_agent(
+        "Other docs for M12205", model, Tools(FakeBrowser(1), tmp_path), conversation=history
+    )
+    results = [json.loads(m["content"])["result"] for m in history if m["role"] == "tool"]
+    assert "retired" in results[0]["observation"]
+    assert "text" not in results[0]["observation"]
+    assert "text" in results[1]["observation"]
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    assert "text" in events[0]["output"]["result"]["observation"]
+
+
+class TaskBrowser(FakeBrowser):
+    def __init__(self, count=2, fail=None):
+        super().__init__(count, fail)
+        self.dialog = None
+        self.searches = []
+
+    async def search_matter(self, matter_number):
+        self.searches.append(matter_number)
+        return METADATA.copy()
+
+    async def category_documents(self, category, count):
+        return [{"id": str(i), "title": f"Document {i}"} for i in range(min(count, 10))]
+
+    async def observe_page(self):
+        observation = await super().observe_page()
+        observation["dialog"] = "Download Files" if self.dialog is not None else None
+        observation["elements"] = (
+            [
+                {
+                    "ref": "file",
+                    "tag": "div",
+                    "role": "button",
+                    "label": "attachment.pdf",
+                    "context": "",
+                },
+                {"ref": "close", "tag": "button", "label": "Close", "context": ""},
+            ]
+            if self.dialog is not None
+            else [
+                {
+                    "ref": f"row_{i}",
+                    "tag": "button",
+                    "label": "GO GET IT",
+                    "context": f"{i} Document {i}",
+                }
+                for i in range(self.count)
+            ]
+        )
+        return observation
+
+    async def click(self, element_ref):
+        if element_ref == "close":
+            self.dialog = None
+            return {
+                "target": {"label": "Close", "context": ""},
+                "observation": await self.observe_page(),
+            }
+        if element_ref.startswith("row_"):
+            self.dialog = element_ref.removeprefix("row_")
+        return await super().click(element_ref)
+
+
+async def test_task_tools_download_individually_with_compact_results(tmp_path):
+    browser = TaskBrowser()
+    tools = Tools(browser, tmp_path)
+    matter = await tools.execute(
+        "search_matter", {"matter_number": "M12205", "document_type": "Other Documents"}
+    )
+    assert matter["matter"]["matter_number"] == "M12205"
+    listing = await tools.execute("open_category", {"category": "Other Documents"})
+    assert len(listing["documents"]) == 2
+    assert browser.download_calls == []  # The model still has to choose each download.
+    for document in listing["documents"]:
+        result = await tools.execute("download_document", {"document_id": document["id"]})
+        assert "observation" not in result
+        assert browser.dialog is None
+    await tools.download_document("0")
+    assert browser.download_calls == ["0", "1"]
+    assert "observation" not in matter
+    assert "observation" not in listing
+    assert (await tools.create_archive())["status"] == "complete"
+
+
+async def test_task_download_failure_can_resume_after_browser_recovery(tmp_path):
+    tools = Tools(TaskBrowser(fail="0"), tmp_path)
+    await tools.search_matter("M12205", "Other Documents")
+    await tools.open_category("Other Documents")
+    with pytest.raises(ValueError, match="unavailable"):
+        await tools.download_document("0")
+    assert "0" in tools.failures
+    # The model can inspect and close the dialog, then choose to retry the task.
+    assert (await tools.observe_page())["observation"]["dialog"]
+    await tools.click("close")
+    tools.browser.fail = None
+    await tools.download_document("0")
+    await tools.download_document("1")
+    assert tools.failures == {}
+    assert (await tools.create_archive())["status"] == "complete"
+
+
+async def test_task_scope_and_empty_category(tmp_path):
+    tools = Tools(TaskBrowser(count=0), tmp_path)
+    with pytest.raises(ValueError, match="Search the matter"):
+        await tools.open_category("Other Documents")
+    await tools.search_matter("M12205", "Other Documents")
+    with pytest.raises(ValueError, match="requested category"):
+        await tools.open_category("Exhibits")
+    assert (await tools.open_category("Other Documents"))["documents"] == []
+    assert (await tools.create_archive())["status"] == "complete"
+
+
+async def test_agent_can_switch_from_task_failure_to_browser_recovery(tmp_path):
+    class RecoveringBrowser(TaskBrowser):
+        async def click(self, element_ref):
+            if element_ref == "close":
+                self.fail = None
+            return await super().click(element_ref)
+
+    model = ScriptedModel(
+        [
+            call("search_matter", matter_number="M12205", document_type="Other Documents"),
+            call("open_category", category="Other Documents"),
+            call("download_document", document_id="0"),
+            call("observe_page"),
+            call("click", element_ref="close"),
+            call("download_document", document_id="0"),
+            call("create_archive"),
+            {"role": "assistant", "content": "Your ZIP is ready."},
+        ]
+    )
+    browser = RecoveringBrowser(count=1, fail="0")
+    result, _ = await run_agent("Other docs for M12205", model, Tools(browser, tmp_path))
+    assert result["status"] == "complete"
+    assert browser.download_calls == ["0", "0"]
+    assert any(not outcome["ok"] for outcome in model.seen_tool_errors)

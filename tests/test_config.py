@@ -1,7 +1,7 @@
 import pytest
 
+from document_retrieval_agent.agent.model import DEFAULT_API_BASE, DEFAULT_MODEL
 from document_retrieval_agent.config import ModelConfig
-from document_retrieval_agent.model import DEFAULT_API_BASE, DEFAULT_MODEL
 
 
 @pytest.fixture(autouse=True)

@@ -11,7 +11,7 @@ import pytest
 from svix.webhooks import Webhook
 
 from document_retrieval_agent.config import ModelConfig
-from document_retrieval_agent.email_server import EmailConfig, create_app, prepare_reply
+from document_retrieval_agent.email.server import EmailConfig, create_app, prepare_reply
 
 SECRET = "whsec_" + base64.b64encode(b"test-webhook-signing-secret").decode()
 ADDRESS = "agent@documents.julianbk.com"
@@ -266,7 +266,7 @@ async def test_delivery_failure_is_logged_without_automatic_retry(mail, caplog):
 
 
 async def test_oversized_zip_sends_an_explanation(mail, monkeypatch):
-    monkeypatch.setattr("document_retrieval_agent.email_server.MAX_ATTACHMENT_BYTES", 4)
+    monkeypatch.setattr("document_retrieval_agent.email.server.MAX_ATTACHMENT_BYTES", 4)
     (await mail.deliver())
     assert mail.sent[0][1]["attachments"] == []
     assert "too large to attach" in mail.sent[0][1]["text"]
@@ -372,7 +372,7 @@ async def test_webhook_acknowledgment_is_sent_before_agent_starts(tmp_path):
 
 
 async def test_default_runner_uses_existing_agent_and_saves_its_result(tmp_path, monkeypatch):
-    from document_retrieval_agent import email_server
+    from document_retrieval_agent.email import server as email_server
 
     config = configuration(tmp_path)
     browser_closed = False
@@ -398,7 +398,7 @@ async def test_default_runner_uses_existing_agent_and_saves_its_result(tmp_path,
         )
         return Model()
 
-    monkeypatch.setattr(email_server, "UARBBrowser", Browser)
+    monkeypatch.setattr(email_server, "BrowserSession", Browser)
     monkeypatch.setattr(email_server, "ChatModel", model_factory)
     result = await email_server.run_request(
         "Get documents for M12205", config.model, tmp_path / "run"

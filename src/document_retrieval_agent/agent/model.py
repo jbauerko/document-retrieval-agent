@@ -20,9 +20,10 @@ class Model(Protocol):
 
 
 def retry_delay(response: httpx.Response) -> float:
-    """Honor a numeric Retry-After header, bounded between one and ten seconds."""
+    """Allow a rate-limit window to reset while keeping waits bounded."""
     try:
-        return min(10, max(1, float(response.headers.get("retry-after", "1"))))
+        default = "60" if response.status_code == 429 else "1"
+        return min(60, max(1, float(response.headers.get("retry-after", default))))
     except ValueError:
         return 1
 

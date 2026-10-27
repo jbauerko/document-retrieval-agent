@@ -6,7 +6,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from .model import DEFAULT_API_BASE, DEFAULT_MODEL, MISSING_API_KEY_MESSAGE
+from .agent.model import DEFAULT_API_BASE, DEFAULT_MODEL, MISSING_API_KEY_MESSAGE
 
 
 @dataclass(frozen=True)

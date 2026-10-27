@@ -3,7 +3,7 @@ import json
 import httpx
 import pytest
 
-from document_retrieval_agent.model import ChatModel
+from document_retrieval_agent.agent.model import ChatModel
 
 
 async def test_model_endpoint_and_provider_fields_are_preserved():
@@ -54,7 +54,7 @@ async def test_transient_error_is_retried_once(monkeypatch):
     async def no_sleep(delay):
         pass
 
-    monkeypatch.setattr("document_retrieval_agent.model.asyncio.sleep", no_sleep)
+    monkeypatch.setattr("document_retrieval_agent.agent.model.asyncio.sleep", no_sleep)
 
     def respond(request):
         nonlocal calls
@@ -85,7 +85,7 @@ async def test_repeated_server_errors_stop_after_two_attempts(monkeypatch):
     async def no_sleep(delay):
         pass
 
-    monkeypatch.setattr("document_retrieval_agent.model.asyncio.sleep", no_sleep)
+    monkeypatch.setattr("document_retrieval_agent.agent.model.asyncio.sleep", no_sleep)
 
     def respond(request):
         nonlocal calls
@@ -110,3 +110,12 @@ async def test_incomplete_model_answers_are_rejected(reason):
     )
     with pytest.raises(RuntimeError, match="stopped before completing"):
         await model.complete([], [])
+
+
+def test_rate_limit_retry_allows_window_to_reset():
+    from document_retrieval_agent.agent.model import retry_delay
+
+    assert retry_delay(httpx.Response(429)) == 60
+    assert retry_delay(httpx.Response(429, headers={"retry-after": "13"})) == 13
+    assert retry_delay(httpx.Response(503)) == 1
+    assert retry_delay(httpx.Response(429, headers={"retry-after": "120"})) == 60

@@ -31,9 +31,9 @@ def test_request_to_real_zip_and_draft(tmp_path):
         "--output",
         str(tmp_path),
         "--timeout",
-        "240",
+        "600",
     ]
-    completed = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=270)
+    completed = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=630)
     assert completed.returncode == 0, completed.stderr + completed.stdout
     directory = next(tmp_path.iterdir())
     result = json.loads((directory / "result.json").read_text())
