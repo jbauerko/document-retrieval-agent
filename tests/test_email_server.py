@@ -1,8 +1,7 @@
+import asyncio
 import base64
 import json
-import sqlite3
 import zipfile
-from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
@@ -34,7 +33,6 @@ def configuration(tmp_path):
         resend_api_key="test-resend-key",
         webhook_secret=SECRET,
         model=ModelConfig("test-model", "https://model.test/v1", "test-model-key"),
-        state_path=tmp_path / "email.sqlite3",
         output_dir=tmp_path / "runs",
     )
 
@@ -83,7 +81,9 @@ async def mail(tmp_path):
         state.sent.append((dict(request.headers), json.loads(request.content)))
         return httpx.Response(state.send_status, json={"id": "outbound-test-id"})
 
-    state.app = create_app(config, runner=runner, transport=httpx.MockTransport(respond))
+    state.runner = runner
+    state.transport = httpx.MockTransport(respond)
+    state.app = create_app(config, runner=runner, transport=state.transport)
     state.event = {
         "type": "email.received",
         "data": {
@@ -107,11 +107,6 @@ async def mail(tmp_path):
         yield state
 
 
-def stored_status(mail):
-    with closing(sqlite3.connect(mail.config.state_path)) as database:
-        return database.execute("SELECT status, reply_id, error FROM emails").fetchone()
-
-
 async def test_verified_email_runs_agent_and_sends_threaded_zip(mail):
     response = await mail.deliver()
     assert response.json() == {"status": "accepted"}
@@ -128,22 +123,59 @@ async def test_verified_email_runs_agent_and_sends_threaded_zip(mail):
     assert sent["headers"]["Auto-Submitted"] == "auto-replied"
     path = mail.config.output_dir / mail.event["data"]["email_id"] / "documents.zip"
     assert base64.b64decode(sent["attachments"][0]["content"]) == path.read_bytes()
-    assert stored_status(mail) == ("sent", "outbound-test-id", None)
 
 
 async def test_duplicate_delivery_does_not_run_or_send_again(mail):
     assert (await mail.deliver()).json()["status"] == "accepted"
     assert (await mail.deliver()).json()["status"] == "duplicate"
     assert len(mail.requests) == len(mail.sent) == 1
-    # A fresh application instance still recognizes the stored message ID.
+
+
+async def test_restart_clears_duplicate_history_and_reuses_send_idempotency_key(mail):
+    await mail.deliver()
+    app = create_app(mail.config, runner=mail.runner, transport=mail.transport)
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=create_app(mail.config)), base_url="http://test"
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as restarted:
         payload = json.dumps(mail.event)
         response = await restarted.post(
             "/webhooks/resend", content=payload, headers=signed_headers(payload)
         )
-    assert response.json() == {"status": "duplicate"}
+    assert response.json() == {"status": "accepted"}
+    assert len(mail.requests) == len(mail.sent) == 2
+    assert mail.sent[0][0]["idempotency-key"] == mail.sent[1][0]["idempotency-key"]
+
+
+async def test_duplicate_is_skipped_while_original_is_still_processing(mail):
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def runner(request, model_config, directory):
+        started.set()
+        await finish.wait()
+        return await mail.runner(request, model_config, directory)
+
+    app = create_app(mail.config, runner=runner, transport=mail.transport)
+    payload = json.dumps(mail.event)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first = asyncio.create_task(
+            client.post("/webhooks/resend", content=payload, headers=signed_headers(payload))
+        )
+        try:
+            async with asyncio.timeout(2):
+                await started.wait()
+                duplicate = await client.post(
+                    "/webhooks/resend", content=payload, headers=signed_headers(payload)
+                )
+            assert duplicate.json() == {"status": "duplicate"}
+            assert mail.sent == []
+        finally:
+            finish.set()
+            response = await first
+        assert response.json() == {"status": "accepted"}
+    assert len(mail.requests) == len(mail.sent) == 1
 
 
 async def test_tampered_payload_is_rejected_before_processing(mail):
@@ -188,7 +220,6 @@ async def test_auto_reply_is_filtered_after_fetching_headers(mail):
     assert (await mail.deliver()).status_code == 200
     assert len(mail.received) == 1
     assert mail.requests == mail.sent == []
-    assert stored_status(mail)[0] == "ignored"
 
 
 async def test_clarification_requests_a_new_complete_email(mail):
@@ -225,10 +256,10 @@ async def test_reply_to_header_selects_recipient_and_preserves_re_subject(mail):
     assert mail.sent[0][1]["subject"] == "Re: Existing thread"
 
 
-async def test_delivery_failure_is_recorded_without_automatic_retry(mail):
+async def test_delivery_failure_is_logged_without_automatic_retry(mail, caplog):
     mail.send_status = 503
     (await mail.deliver())
-    assert stored_status(mail)[0] == "failed"
+    assert "503" in caplog.text
     assert len(mail.sent) == 1
     assert (await mail.deliver()).json() == {"status": "duplicate"}
     assert len(mail.sent) == 1
@@ -254,10 +285,10 @@ async def test_health_endpoint_does_not_require_webhook_headers(mail):
     assert (await mail.client.get("/health")).json() == {"status": "ok"}
 
 
-async def test_fetch_failure_is_recorded_without_running_agent(mail):
+async def test_fetch_failure_is_logged_without_running_agent(mail, caplog):
     mail.get_status = 401
     await mail.deliver()
-    assert stored_status(mail)[0] == "failed"
+    assert "401" in caplog.text
     assert mail.requests == mail.sent == []
 
 

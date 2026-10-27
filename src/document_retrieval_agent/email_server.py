@@ -4,9 +4,7 @@ import asyncio
 import base64
 import logging
 import os
-import sqlite3
 from collections.abc import Awaitable, Callable
-from contextlib import closing
 from dataclasses import dataclass, field
 from email.utils import getaddresses, parseaddr
 from pathlib import Path
@@ -39,7 +37,6 @@ class EmailConfig:
     webhook_secret: str = field(repr=False)
     model: ModelConfig
     agent_email: str = "agent@documents.julianbk.com"
-    state_path: Path = Path("data/email.sqlite3")
     output_dir: Path = Path("runs/email")
 
     @classmethod
@@ -56,38 +53,8 @@ class EmailConfig:
             webhook_secret=os.environ["RESEND_WEBHOOK_SECRET"],
             model=model,
             agent_email=address,
-            state_path=Path(os.getenv("EMAIL_STATE_PATH", "data/email.sqlite3")),
             output_dir=Path(os.getenv("EMAIL_OUTPUT_DIR", "runs/email")),
         )
-
-
-def initialize_database(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(path)) as database:
-        database.execute("""CREATE TABLE IF NOT EXISTS emails (
-            email_id TEXT PRIMARY KEY, status TEXT NOT NULL, run_directory TEXT,
-            reply_id TEXT, error TEXT, updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )""")
-        database.commit()
-
-
-def claim_email(path: Path, email_id: str) -> bool:
-    with closing(sqlite3.connect(path)) as database:
-        cursor = database.execute(
-            "INSERT OR IGNORE INTO emails (email_id, status) VALUES (?, 'processing')", (email_id,)
-        )
-        database.commit()
-        return cursor.rowcount == 1
-
-
-def record_status(config: EmailConfig, email_id: str, status: str, *, reply_id=None, error=None):
-    with closing(sqlite3.connect(config.state_path)) as database:
-        database.execute(
-            """UPDATE emails SET status=?, run_directory=?, reply_id=?, error=?,
-               updated_at=CURRENT_TIMESTAMP WHERE email_id=?""",
-            (status, str((config.output_dir / email_id).resolve()), reply_id, error, email_id),
-        )
-        database.commit()
 
 
 def addresses(value: str | list[str]) -> list[str]:
@@ -164,7 +131,7 @@ def prepare_reply(email: dict, result: dict, config: EmailConfig, directory: Pat
 
 
 async def process_email(email_id: str, config: EmailConfig, runner, transport=None) -> None:
-    """Process once; failures are recorded for manual reruns, never retried here."""
+    """Process once; failures are logged for manual reruns, never retried here."""
     try:
         directory = config.output_dir / email_id
         directory.mkdir(parents=True, exist_ok=True)
@@ -179,7 +146,7 @@ async def process_email(email_id: str, config: EmailConfig, runner, transport=No
             if config.agent_email.lower() not in addresses(email.get("to", [])) or is_automated(
                 email, config.agent_email
             ):
-                record_status(config, email_id, "ignored")
+                logger.info("Email %s: ignored automated or unrelated message", email_id)
                 return
 
             text = (email.get("text") or "").strip()
@@ -201,15 +168,13 @@ async def process_email(email_id: str, config: EmailConfig, runner, transport=No
                 headers={"Idempotency-Key": f"document-retrieval-agent/{email_id}"},
             )
             response.raise_for_status()
-            record_status(config, email_id, "sent", reply_id=response.json()["id"])
-            logger.info("Email %s: reply accepted by Resend", email_id)
+            logger.info("Email %s: reply accepted by Resend (%s)", email_id, response.json()["id"])
     except Exception as exc:
         error = (
             str(exc)
             .replace(config.resend_api_key, "[redacted]")
             .replace(config.model.api_key, "[redacted]")
         )
-        record_status(config, email_id, "failed", error=error)
         logger.error("Email %s failed: %s", email_id, error)
 
 
@@ -221,7 +186,7 @@ def create_app(
 ) -> FastAPI:
     config = config or EmailConfig.from_environment()
     verifier = Webhook(config.webhook_secret)
-    initialize_database(config.state_path)
+    seen_email_ids: set[str] = set()
     processing_lock = asyncio.Lock()
     app = FastAPI(title="Document Retrieval Agent Email")
 
@@ -253,8 +218,11 @@ def create_app(
             raise HTTPException(400, "Invalid email ID or recipients") from exc
         if config.agent_email.lower() not in recipients or is_automated(data, config.agent_email):
             return {"status": "ignored"}
-        if not claim_email(config.state_path, email_id):
+        # No await between checking and adding: concurrent deliveries in this
+        # process cannot schedule the same email twice, even while it is running.
+        if email_id in seen_email_ids:
             return {"status": "duplicate"}
+        seen_email_ids.add(email_id)
         background.add_task(process_once, email_id)
         return {"status": "accepted"}
 
