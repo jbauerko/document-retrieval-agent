@@ -1,0 +1,1 @@
+"""Local document retrieval agent."""
